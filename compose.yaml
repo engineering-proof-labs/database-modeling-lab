@@ -6,9 +6,28 @@ x-api-common: &api-common
   ports:
     - "127.0.0.1:18081:8080"
 
+x-postgres-api-env: &postgres-api-env
+  <<: *api-clock
+  SPRING_PROFILES_ACTIVE: postgres
+  DB_URL: jdbc:postgresql://postgres:5432/orders
+  DB_USERNAME: orders_app
+  DB_PASSWORD: orders_local
+
+x-postgres-replica: &postgres-replica
+  profiles: ["replicas"]
+  build: .
+  depends_on:
+    postgres:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+    interval: 2s
+    timeout: 2s
+    retries: 45
+
 services:
   postgres:
-    profiles: ["postgres"]
+    profiles: ["postgres", "replicas"]
     image: postgres:17.12-bookworm
     environment:
       POSTGRES_DB: orders
@@ -28,14 +47,35 @@ services:
     <<: *api-common
     profiles: ["postgres"]
     environment:
-      <<: *api-clock
-      SPRING_PROFILES_ACTIVE: postgres
-      DB_URL: jdbc:postgresql://postgres:5432/orders
-      DB_USERNAME: orders_app
-      DB_PASSWORD: orders_local
+      <<: *postgres-api-env
       LAB_FAILURE_INJECTION_ENABLED: "true"
     depends_on:
       postgres:
+        condition: service_healthy
+
+  api-replica-a:
+    <<: *postgres-replica
+    environment:
+      <<: *postgres-api-env
+      LAB_INSTANCE_ID: orders-a
+
+  api-replica-b:
+    <<: *postgres-replica
+    environment:
+      <<: *postgres-api-env
+      LAB_INSTANCE_ID: orders-b
+
+  orders-proxy:
+    profiles: ["replicas"]
+    image: nginx:1.30.2-alpine
+    ports:
+      - "127.0.0.1:18082:8080"
+    volumes:
+      - ./nginx/replicas.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api-replica-a:
+        condition: service_healthy
+      api-replica-b:
         condition: service_healthy
 
   mongodb:

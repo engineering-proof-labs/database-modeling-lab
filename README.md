@@ -273,11 +273,61 @@ db.orders.find(
 ).sort({createdAt: -1, _id: -1}).limit(11).explain("executionStats")
 ```
 
+## Confirm the same order on two replicas
+
+```sh
+docker compose --profile "*" down --remove-orphans
+docker compose --profile replicas up --build -d
+```
+
+The `replicas` profile puts two API processes behind nginx. The proxy is exposed at `127.0.0.1:18082` and uses round-robin routing with upstream retries disabled. Both processes connect to the same PostgreSQL database. The APIs set their own `X-Instance-ID` response headers. [nginx load balancing](https://nginx.org/en/docs/http/load_balancing.html)
+
+```mermaid
+sequenceDiagram
+    participant C as Two HTTP clients
+    participant N as nginx
+    participant B as orders-b
+    participant A as orders-a
+    participant P as PostgreSQL
+    par Request 1
+        C->>N: POST confirm for the same order
+        N->>B: Forward request
+        B->>P: UPDATE where status is PENDING
+        P-->>B: One row updated
+        B-->>N: 200, X-Instance-ID orders-b
+        N-->>C: 200
+    and Request 2
+        C->>N: POST confirm for the same order
+        N->>A: Forward request
+        A->>P: UPDATE where status is PENDING
+        P-->>A: Zero rows updated
+        A-->>N: 409, X-Instance-ID orders-a
+        N-->>C: 409
+    end
+```
+
+In PowerShell 7, run the shared verifier against the proxy:
+
+```powershell
+pwsh -NoProfile -File scripts/verify-concurrency.ps1 -BaseUri http://127.0.0.1:18082 -RequireDistinctInstances -Iterations 10
+docker compose --profile replicas logs --no-log-prefix orders-proxy
+```
+
+The verifier connects two sockets, releases them from a barrier, and sends one HTTP request per socket. It logs both response IDs. A valid attempt requires `200` and `409` from different instances, a final `CONFIRMED` read, and an unchanged `confirmedAt` after an explicit repeat. If the same instance handles both requests, the verifier reports the attempt and uses a new order, within the stated bound. The proxy routes the requests and the database decides which update succeeds. The barrier aligns client sends without asserting the SQL statements overlapped.
+
+In the observed run, `orders-b` returned `200` and `orders-a` returned `409` for the same order on the first attempt. The logs recorded separate upstream addresses. Use the ID printed by your run to check the row in PostgreSQL:
+
+```powershell
+$orderId = '<order-id>'
+docker compose --profile replicas exec -T postgres psql -v ON_ERROR_STOP=1 -U orders_app -d orders -c "SELECT id, status, confirmed_at FROM orders WHERE id = '$orderId'::uuid;"
+```
+
 ## Demo walkthrough
 
 1. Show the four storage models, then create the same two-item order in two profiles. Inspect the PostgreSQL rows and the MongoDB document next to their matching HTTP responses.
 2. Run the concurrency verifier and show the two HTTP statuses and the final order state. Point to the condition on `PENDING` in the database operation.
 3. Run the pending verifier. Show the two pages, the fixed time window, and the result after confirmation. Compare the PostgreSQL partial index with the DynamoDB sparse index.
+4. Switch to the replicas profile. Frame the output with the same order ID, the two instance IDs and statuses, and the PostgreSQL row.
 
 ## Stop and reset
 

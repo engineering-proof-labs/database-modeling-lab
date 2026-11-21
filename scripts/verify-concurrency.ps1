@@ -1,7 +1,8 @@
 param(
     [string]$BaseUri = 'http://localhost:18081',
     [ValidateRange(1, 100)]
-    [int]$Iterations = 10
+    [int]$Iterations = 10,
+    [switch]$RequireDistinctInstances
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,8 +10,9 @@ $ErrorActionPreference = 'Stop'
 if (-not ('ConfirmRaceRunner' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
+using System.IO;
 using System.Linq;
-using System.Net.Http;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -18,12 +20,12 @@ using System.Threading.Tasks;
 public sealed class ConfirmRaceResult
 {
     public int StatusCode { get; private set; }
-    public string Body { get; private set; }
+    public string InstanceId { get; private set; }
 
-    public ConfirmRaceResult(int statusCode, string body)
+    public ConfirmRaceResult(int statusCode, string instanceId)
     {
         StatusCode = statusCode;
-        Body = body;
+        InstanceId = instanceId;
     }
 }
 
@@ -41,22 +43,51 @@ public static class ConfirmRaceRunner
         {
             var tasks = Enumerable.Range(0, 2).Select(index => Task.Run(() =>
             {
-                using (var handler = new SocketsHttpHandler { UseProxy = false })
-                using (var client = new HttpClient(handler))
+                var target = new Uri(index == 0 ? firstUri : secondUri);
+                if (target.Scheme != "http")
                 {
-                    client.Timeout = TimeSpan.FromSeconds(8);
+                    throw new ArgumentException("The lab race verifier requires a local HTTP endpoint.");
+                }
+
+                using (var client = new TcpClient())
+                using (var connectTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(8)))
+                {
+                    client.ConnectAsync(target.DnsSafeHost, target.Port, connectTimeout.Token).AsTask().GetAwaiter().GetResult();
+                    client.ReceiveTimeout = 8000;
+                    client.SendTimeout = 8000;
+                    client.NoDelay = true;
                     ready.Signal();
                     if (!release.Wait(TimeSpan.FromSeconds(15)))
                     {
                         throw new TimeoutException("The race barrier was not released in time.");
                     }
 
-                    string uri = index == 0 ? firstUri : secondUri;
-                    using (var content = new StringContent("", Encoding.UTF8, "application/json"))
-                    using (var response = client.PostAsync(uri, content).GetAwaiter().GetResult())
+                    using (var stream = client.GetStream())
+                    using (var reader = new StreamReader(stream, Encoding.ASCII))
                     {
-                        string body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-                        return new ConfirmRaceResult((int)response.StatusCode, body);
+                        // One request on this socket, with no redirect or connection retry.
+                        var request = Encoding.ASCII.GetBytes(
+                            $"POST {target.PathAndQuery} HTTP/1.1\r\nHost: {target.Authority}\r\n" +
+                            "Content-Length: 0\r\nConnection: close\r\n\r\n");
+                        stream.Write(request, 0, request.Length);
+                        var parts = (reader.ReadLine() ?? "").Split(' ', 3);
+                        if (parts.Length < 2 || !parts[0].StartsWith("HTTP/1.") ||
+                            !int.TryParse(parts[1], out int status))
+                        {
+                            throw new IOException("Expected an HTTP status line.");
+                        }
+
+                        string instance = "";
+                        string line;
+                        const string header = "X-Instance-ID:";
+                        while (!string.IsNullOrEmpty(line = reader.ReadLine()))
+                        {
+                            if (line.StartsWith(header, StringComparison.OrdinalIgnoreCase))
+                            {
+                                instance = line.Substring(header.Length).Trim();
+                            }
+                        }
+                        return new ConfirmRaceResult(status, instance);
                     }
                 }
             })).ToArray();
@@ -110,6 +141,10 @@ for ($iteration = 1; $iteration -le $Iterations; $iteration++) {
     $order = Invoke-RestMethod -Uri "$BaseUri/orders" -Method Post -ContentType 'application/json' -Body $payload
     $results = @([ConfirmRaceRunner]::Run("$BaseUri/orders/$($order.id)/confirm"))
     $statuses = @($results | ForEach-Object StatusCode | Sort-Object)
+    if ($RequireDistinctInstances) {
+        $observed = ($results | ForEach-Object { "$($_.InstanceId):$($_.StatusCode)" }) -join ','
+        "attempt=$iteration orderId=$($order.id) responses=$observed"
+    }
     if ($statuses.Count -ne 2 -or ($statuses -join ',') -ne '200,409') {
         throw "Expected one 200 and one 409 for $($order.id); received $($statuses -join ',')."
     }
@@ -130,4 +165,19 @@ for ($iteration = 1; $iteration -le $Iterations; $iteration++) {
     }
 
     "iteration=$iteration orderId=$($order.id) race=$($statuses -join ',') final=$($confirmed.status) repeat=$($repeat.StatusCode) confirmedAt=$($firstConfirmedAt.ToString('o'))"
+
+    if ($RequireDistinctInstances) {
+        if (@($results | Where-Object { $_.InstanceId -notin 'orders-a', 'orders-b' }).Count -gt 0) {
+            throw 'Expected both confirmation responses to carry an ID from the replicas profile.'
+        }
+        if ($results[0].InstanceId -ne $results[1].InstanceId) {
+            "crossReplica=PASS orderId=$($order.id) responses=$observed"
+            return
+        }
+        "crossReplica=INCONCLUSIVE attempt=$iteration reason=same-instance"
+    }
+}
+
+if ($RequireDistinctInstances) {
+    throw "No cross-replica race observed within $Iterations attempts."
 }
