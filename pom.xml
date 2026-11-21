@@ -22,9 +22,21 @@
         <postgresql.version>42.7.8</postgresql.version>
         <mongodb-driver.version>5.15.0</mongodb-driver.version>
         <aws-sdk.version>2.55.15</aws-sdk.version>
+        <ojdbc.version>23.9.0.25.07</ojdbc.version>
     </properties>
 
     <dependencies>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-oracle</artifactId>
+            <version>${flyway.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.oracle.database.jdbc</groupId>
+            <artifactId>ojdbc11</artifactId>
+            <version>${ojdbc.version}</version>
+            <scope>runtime</scope>
+        </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>dynamodb</artifactId>

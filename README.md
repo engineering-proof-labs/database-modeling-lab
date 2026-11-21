@@ -1,6 +1,6 @@
 # One Orders API, Four Databases
 
-This lab compares the same orders API on PostgreSQL, MongoDB, and DynamoDB Local. Oracle is the next database in the comparison. Each adapter exposes its database operations directly in the code.
+This lab compares the same orders API on PostgreSQL, MongoDB, DynamoDB Local, and Oracle. Each adapter exposes its database operations directly in the code.
 
 The PostgreSQL slice uses PostgreSQL 17.12, Java 21, Spring Boot 4.2.0, Flyway 11.20.0, and the PostgreSQL JDBC driver 42.7.8. The MongoDB slice uses MongoDB 8.0.38 and the synchronous Java driver 5.15.0. Docker Compose profiles start only the selected database and API. Database and Java images use fixed version tags.
 
@@ -168,6 +168,44 @@ docker compose --profile dynamodb exec -T dynamodb curl -fsS \
 
 The local run demonstrates key selection, pagination, and conditional writes. Managed DynamoDB throughput, physical distribution, propagation delay, and latency require separate measurements. [DynamoDB Local usage notes](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.UsageNotes.html)
 
+## Run the Oracle slice
+
+```sh
+docker compose --profile "*" down --remove-orphans
+docker compose --profile oracle up --build -d
+docker compose --profile oracle logs -f api-oracle
+```
+
+This profile uses Oracle AI Database 26ai Free Lite (image tag `23.26.4.0-lite`) and JDBC Thin 23.9. The startup script `scripts/oracle-create-user.sql` provisions `orders_app` and its `ORDERS_DATA` tablespace inside `FREEPDB1`. The account can connect and create tables and indexes in its own schema, with a 128 MB quota. The healthcheck runs a query as this user before the API begins its Flyway migrations. The database listener stays on the Compose network.
+
+After the API starts, seed the pagination fixture and run the shared checks in PowerShell:
+
+```powershell
+Get-Content -Raw scripts/seed-oracle.sql | docker compose --profile oracle exec -T oracle sqlplus -L -s orders_app/OrdersLocal42@//localhost:1521/FREEPDB1
+.\scripts\verify-pagination.ps1 -BaseUri http://127.0.0.1:18081
+.\scripts\verify-concurrency.ps1 -Iterations 10 -BaseUri http://127.0.0.1:18081
+```
+
+Oracle and PostgreSQL both insert the order and its item rows in one transaction and confirm through an `UPDATE` conditioned on `PENDING`. Oracle uses `VARCHAR2` for canonical UUIDs, `NUMBER` for cents and quantities, and `TIMESTAMP(3)` for UTC values. The Java adapter explicitly reads and writes those timestamps as UTC. Oracle uses `FETCH FIRST` and expands the cursor comparison into predicates on the timestamp and ID. Its index supports a backward scan for descending order.
+
+To reproduce the rollback probe, run the same HTTP request with `X-Lab-Fail-After-Order: true` from the PostgreSQL section. On Oracle it should also return `500 INJECTED_WRITE_FAILURE`. Run the following counts before and after without concurrent writers. Both counts should stay the same.
+
+```powershell
+@'
+SELECT COUNT(*) AS orders_count FROM orders;
+SELECT COUNT(*) AS items_count FROM order_items;
+EXIT SUCCESS
+'@ | docker compose --profile oracle exec -T oracle sqlplus -L -s orders_app/OrdersLocal42@//localhost:1521/FREEPDB1
+```
+
+Show the optimizer plans for the first and later pages. The script inserts 20,000 disposable orders and rolls them back:
+
+```powershell
+Get-Content -Raw scripts/explain-oracle-customer-orders.sql | docker compose --profile oracle exec -T oracle sqlplus -L -s orders_app/OrdersLocal42@//localhost:1521/FREEPDB1
+```
+
+Both plans showed a descending range scan on the customer index and a row limit. In the cursor plan, Oracle used the timestamp and ID as a filter within the customer's range. These are optimizer estimates for this local fixture. [Oracle Database Free container guidance](https://container-registry.oracle.com/ords/ocr/ba/database/free)
+
 ## Stop and reset
 
 Stop the services and keep database data:
@@ -191,6 +229,7 @@ The Compose credentials and exposed ports are for local learning only.
 - Implemented: conditional confirmation with `200`, `409`, and `404` outcomes, plus customer-order keyset pagination with a customer-scoped opaque cursor.
 - Implemented: MongoDB document storage with embedded items, conditional confirmation, and customer-order keyset pagination.
 - Implemented: DynamoDB Local item storage, conditional confirmation, and pagination on a customer index.
-- Pending: Oracle and the cross-customer list of recent pending orders.
+- Implemented: Oracle transactional storage, conditional confirmation, and customer-order pagination.
+- Pending: the cross-customer list of recent pending orders.
 
 Money is stored as integer cents, timestamps are stored as UTC instants, and item rows are immutable after creation. The common limit is 20 items, 999 units per item, 120 characters per product name, and at most 100,000,000 cents per unit. These bounds keep the same order representable in the later database models.
