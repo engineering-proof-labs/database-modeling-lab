@@ -97,4 +97,19 @@ public class OrderService {
                 : null;
         return new OrderPage(pageItems, nextCursor);
     }
+
+    public OrderPage listPendingOrders(int limit, String encodedCursor) {
+        if (limit < 1 || limit > 50) {
+            throw new InvalidPageSizeException();
+        }
+        PendingOrderWindow window = encodedCursor == null
+                ? new PendingOrderWindow(clock.instant().truncatedTo(ChronoUnit.MILLIS), null)
+                : PendingOrderCursorCodec.decode(encodedCursor, repository.backend(), limit);
+        List<OrderSummary> fetched = repository.listPendingOrders(window, limit + 1);
+        List<OrderSummary> pageItems = List.copyOf(fetched.subList(0, Math.min(limit, fetched.size())));
+        String next = fetched.size() > limit
+                ? PendingOrderCursorCodec.encode(repository.backend(), limit, window.asOf(), pageItems.getLast())
+                : null;
+        return new OrderPage(pageItems, next);
+    }
 }

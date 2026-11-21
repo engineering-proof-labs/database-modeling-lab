@@ -47,6 +47,10 @@ public class MongoOrderRepository implements OrderStore {
                         Indexes.descending("createdAt"),
                         Indexes.descending("_id")),
                 new IndexOptions().name("customer_created_id"));
+        orders.createIndex(
+                Indexes.compoundIndex(Indexes.ascending("status"), Indexes.descending("createdAt"),
+                        Indexes.descending("_id")),
+                new IndexOptions().name("status_created_id"));
     }
 
     @Override
@@ -111,8 +115,26 @@ public class MongoOrderRepository implements OrderStore {
                     and(eq("createdAt", cursorTime), lt("_id", cursor.id().toString()))));
         }
 
+        return listSummaries(filter, fetchLimit);
+    }
+
+    @Override
+    public List<OrderSummary> listPendingOrders(PendingOrderWindow window, int fetchLimit) {
+        Bson filter = and(eq("status", "PENDING"), lt("createdAt", Date.from(window.asOf())),
+                com.mongodb.client.model.Filters.gte("createdAt", Date.from(window.start())));
+        if (window.after() != null) {
+            Date cursorTime = Date.from(window.after().createdAt());
+            filter = and(filter, or(
+                    lt("createdAt", cursorTime),
+                    and(eq("createdAt", cursorTime), lt("_id", window.after().id().toString()))));
+        }
+        return listSummaries(filter, fetchLimit);
+    }
+
+    private List<OrderSummary> listSummaries(Bson filter, int fetchLimit) {
         List<OrderSummary> results = new ArrayList<>(fetchLimit);
         for (Document document : orders.find(filter)
+                .projection(include("_id", "customerId", "status", "totalCents", "createdAt"))
                 .sort(Sorts.orderBy(Sorts.descending("createdAt"), Sorts.descending("_id")))
                 .limit(fetchLimit)) {
             results.add(new OrderSummary(

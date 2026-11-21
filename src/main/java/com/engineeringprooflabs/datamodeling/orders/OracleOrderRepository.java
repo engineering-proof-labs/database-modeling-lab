@@ -154,6 +154,24 @@ public class OracleOrderRepository implements OrderStore, CreateFailureProbe {
     }
 
     @Override
+    public List<OrderSummary> listPendingOrders(PendingOrderWindow window, int fetchLimit) {
+        var start = LocalDateTime.ofInstant(window.start(), ZoneOffset.UTC);
+        var end = LocalDateTime.ofInstant(window.asOf(), ZoneOffset.UTC);
+        String query = """
+                SELECT id, customer_id, status, total_cents, created_at
+                FROM orders
+                WHERE status = 'PENDING' AND created_at >= ? AND created_at < ?
+                """;
+        String orderAndLimit = " ORDER BY created_at DESC, id DESC FETCH FIRST ? ROWS ONLY";
+        if (window.after() == null) {
+            return jdbc.query(query + orderAndLimit, ORDER_SUMMARY_MAPPER, start, end, fetchLimit);
+        }
+        var afterTime = LocalDateTime.ofInstant(window.after().createdAt(), ZoneOffset.UTC);
+        return jdbc.query(query + " AND (created_at < ? OR (created_at = ? AND id < ?))" + orderAndLimit,
+                ORDER_SUMMARY_MAPPER, start, end, afterTime, afterTime, window.after().id().toString(), fetchLimit);
+    }
+
+    @Override
     public Optional<OrderView> findById(String id) {
         String orderId = parseOrderId(id);
         if (orderId == null) {

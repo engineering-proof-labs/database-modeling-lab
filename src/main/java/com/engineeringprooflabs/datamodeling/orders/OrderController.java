@@ -11,6 +11,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
@@ -37,6 +38,11 @@ public class OrderController {
 
         OrderView order = orderService.create(request, failAfterOrder);
         return ResponseEntity.created(URI.create("/orders/" + order.id())).body(order);
+    }
+
+    @GetMapping("/pending")
+    OrderPage pending(@RequestParam(defaultValue = "10") int limit, @RequestParam(required = false) String cursor) {
+        return orderService.listPendingOrders(limit, cursor);
     }
 
     @GetMapping("/{id}")

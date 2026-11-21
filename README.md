@@ -2,6 +2,21 @@
 
 This lab compares the same orders API on PostgreSQL, MongoDB, DynamoDB Local, and Oracle. Each adapter exposes its database operations directly in the code.
 
+## One API, four storage models
+
+```mermaid
+flowchart LR
+    HTTP["Orders HTTP API"] --> Store["One active adapter per run"]
+    Store --> PG["PostgreSQL"]
+    Store --> ORA["Oracle"]
+    Store --> MDB["MongoDB"]
+    Store --> DDB["DynamoDB Local"]
+    PG --> PGData["Order row + item rows"]
+    ORA --> ORAData["Order row + item rows"]
+    MDB --> MDBData["Order document with embedded items"]
+    DDB --> DDBData["Order item with embedded line items"]
+```
+
 The PostgreSQL slice uses PostgreSQL 17.12, Java 21, Spring Boot 4.2.0, Flyway 11.20.0, and the PostgreSQL JDBC driver 42.7.8. The MongoDB slice uses MongoDB 8.0.38 and the synchronous Java driver 5.15.0. Docker Compose profiles start only the selected database and API. Database and Java images use fixed version tags.
 
 ## Run the PostgreSQL slice
@@ -206,6 +221,64 @@ Get-Content -Raw scripts/explain-oracle-customer-orders.sql | docker compose --p
 
 Both plans showed a descending range scan on the customer index and a row limit. In the cursor plan, Oracle used the timestamp and ID as a filter within the customer's range. These are optimizer estimates for this local fixture. [Oracle Database Free container guidance](https://container-registry.oracle.com/ords/ocr/ba/database/free)
 
+## List recent pending orders
+
+`GET /orders/pending?limit=10&cursor=...` lists summaries across customers in descending `createdAt` and UUID order. The first request fixes a UTC reference time. The cursor keeps that reference for the next page. The lower bound of the 30-minute window is inclusive and the reference time itself is exclusive. Limits are 1–50. The cursor belongs to this query, backend, and page size.
+
+The cursor fixes the time window. The order status is evaluated on each request, so a confirmed order can disappear between pages. DynamoDB's global secondary index can briefly return a stale summary after confirmation. [DynamoDB read consistency](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html)
+
+The customer history indexes group records by customer. The new query crosses that boundary and needs an access path ordered by time across customers.
+
+```mermaid
+flowchart LR
+    A["11:29:59.999 · outside"] --- B["11:30:00.000 · included"]
+    B === C["11:59:59.999 · included"]
+    C --- D["12:00:00.000 · excluded"]
+    D --> E["Cursor keeps 12:00:00 as the reference"]
+```
+
+| Backend | Access path | Change to writes |
+| --- | --- | --- |
+| PostgreSQL | Partial index on creation time and UUID for `PENDING` rows | Inserts enter the index. Confirmation removes the row from its predicate. |
+| Oracle | Composite index on status, creation time and UUID | Inserts add an entry. Confirmation changes the status in the index key. |
+| MongoDB | Compound index on status, creation time and UUID | Inserts add an entry. Updating the document status changes the key. |
+| DynamoDB Local | Sparse `pending-created` GSI with a fixed pending partition and a time/UUID sort key | Creation adds `pendingBucket`. The conditional confirmation removes it atomically and leaves `createdOrder` available to the customer index. |
+
+DynamoDB Local upgrades the existing table at startup. It creates the index and runs a one-time scan to backfill missing membership attributes on pending orders. The updates are conditional, so an interrupted backfill can resume and a concurrent confirmation cannot reintroduce a confirmed order. Endpoint requests use `Query` with sort key bounds. A single index partition is sufficient for this fixture but may concentrate traffic under load. Splitting it across partitions would require one query per partition and a merge that preserves global order and pagination state. [DynamoDB sparse indexes](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-indexes-general-sparse-indexes.html)
+
+Run the same deterministic verification for each profile in PowerShell. The script replaces eight reserved fixture IDs in the local database. It sets an explicit clock, advances it between pages, confirms one order, and restores the original clock afterward.
+
+```powershell
+foreach ($profile in @('postgres', 'oracle', 'mongodb', 'dynamodb')) {
+    docker compose --profile "*" down --remove-orphans
+    if ($LASTEXITCODE) { throw 'Compose could not stop the previous profile' }
+    pwsh -NoProfile -File scripts/verify-pending.ps1 -Profile $profile
+    if ($LASTEXITCODE) { throw "Pending order verification failed for $profile" }
+}
+```
+
+Inspect the SQL plans while the corresponding database is up. Each script rolls back its 20,000 disposable rows.
+
+```powershell
+Get-Content -Raw scripts/explain-pending-postgres.sql | docker compose --profile postgres exec -T postgres psql -v ON_ERROR_STOP=1 -U orders_app -d orders
+Get-Content -Raw scripts/explain-pending-oracle.sql | docker compose --profile oracle exec -T oracle sqlplus -L -s orders_app/OrdersLocal42@//localhost:1521/FREEPDB1
+```
+
+For MongoDB, run this query in `mongosh orders` after seeding the fixture:
+
+```javascript
+db.orders.find(
+  {status: "PENDING", createdAt: {$gte: ISODate("2040-01-15T11:30:00Z"), $lt: ISODate("2040-01-15T12:00:00Z")}},
+  {_id: 1, customerId: 1, status: 1, totalCents: 1, createdAt: 1}
+).sort({createdAt: -1, _id: -1}).limit(11).explain("executionStats")
+```
+
+## Demo walkthrough
+
+1. Show the four storage models, then create the same two-item order in two profiles. Inspect the PostgreSQL rows and the MongoDB document next to their matching HTTP responses.
+2. Run the concurrency verifier and show the two HTTP statuses and the final order state. Point to the condition on `PENDING` in the database operation.
+3. Run the pending verifier. Show the two pages, the fixed time window, and the result after confirmation. Compare the PostgreSQL partial index with the DynamoDB sparse index.
+
 ## Stop and reset
 
 Stop the services and keep database data:
@@ -230,6 +303,6 @@ The Compose credentials and exposed ports are for local learning only.
 - Implemented: MongoDB document storage with embedded items, conditional confirmation, and customer-order keyset pagination.
 - Implemented: DynamoDB Local item storage, conditional confirmation, and pagination on a customer index.
 - Implemented: Oracle transactional storage, conditional confirmation, and customer-order pagination.
-- Pending: the cross-customer list of recent pending orders.
+- Implemented: paginated list of recent pending orders across customers, with the reference time carried in the cursor.
 
 Money is stored as integer cents, timestamps are stored as UTC instants, and item rows are immutable after creation. The common limit is 20 items, 999 units per item, 120 characters per product name, and at most 100,000,000 cents per unit. These bounds keep the same order representable in the later database models.

@@ -27,6 +27,10 @@ public class DynamoOrderRepository implements OrderStore {
 
     private static final String TABLE = "orders-lab";
     private static final String CUSTOMER_INDEX = "customer-created";
+    private static final String PENDING_INDEX = "pending-created";
+    private static final String PENDING_BUCKET = "pendingBucket";
+    private static final String PENDING = "PENDING";
+    private static final String PENDING_BACKFILL = "migration#pending-created-v1";
     private static final String ID = "id";
     private static final String CUSTOMER = "customerId";
     private static final String SORT = "createdOrder";
@@ -55,6 +59,8 @@ public class DynamoOrderRepository implements OrderStore {
         } catch (ResourceInUseException existingTable) {
             // Retain local data across API restarts.
         }
+
+        migratePendingIndex();
 
         for (String customer : List.of("customer-001", "customer-002", "customer-003")) {
             seedIfAbsent(Map.of(ID, str(customerKey(customer))));
@@ -103,7 +109,7 @@ public class DynamoOrderRepository implements OrderStore {
         try {
             dynamo.updateItem(request -> request.tableName(TABLE).key(key(id))
                     .conditionExpression("#status = :pending")
-                    .updateExpression("SET #status = :confirmed, confirmedAt = :time")
+                    .updateExpression("SET #status = :confirmed, confirmedAt = :time REMOVE pendingBucket")
                     .expressionAttributeNames(Map.of("#status", "status"))
                     .expressionAttributeValues(Map.of(
                             ":pending", str("PENDING"),
@@ -138,6 +144,29 @@ public class DynamoOrderRepository implements OrderStore {
                 .expressionAttributeValues(Map.of(":customer", str(customerId)))
                 .scanIndexForward(false);
 
+        return querySummaries(query, startKey, fetchLimit);
+    }
+
+    @Override
+    public List<OrderSummary> listPendingOrders(PendingOrderWindow window, int fetchLimit) {
+        var query = QueryRequest.builder().tableName(TABLE).indexName(PENDING_INDEX)
+                .keyConditionExpression("pendingBucket = :pending AND createdOrder BETWEEN :start AND :end")
+                // A timestamp-only prefix sorts before every UUID suffix at that timestamp.
+                .expressionAttributeValues(Map.of(":pending", str(PENDING),
+                        ":start", str(sortKey(window.start(), "")),
+                        ":end", str(sortKey(window.asOf(), ""))))
+                .scanIndexForward(false);
+        Map<String, AttributeValue> startKey = null;
+        if (window.after() != null) {
+            String id = window.after().id().toString();
+            startKey = Map.of(ID, str(id), PENDING_BUCKET, str(PENDING),
+                    SORT, str(sortKey(window.after().createdAt(), id)));
+        }
+        return querySummaries(query, startKey, fetchLimit);
+    }
+
+    private List<OrderSummary> querySummaries(
+            QueryRequest.Builder query, Map<String, AttributeValue> startKey, int fetchLimit) {
         List<OrderSummary> orders = new ArrayList<>(fetchLimit);
         do {
             var page = dynamo.query(query.exclusiveStartKey(startKey).limit(fetchLimit - orders.size()).build());
@@ -145,6 +174,43 @@ public class DynamoOrderRepository implements OrderStore {
             startKey = page.lastEvaluatedKey();
         } while (orders.size() < fetchLimit && !startKey.isEmpty());
         return orders;
+    }
+
+    private void migratePendingIndex() {
+        var table = dynamo.describeTable(request -> request.tableName(TABLE)).table();
+        if (table.globalSecondaryIndexes().stream().noneMatch(index -> PENDING_INDEX.equals(index.indexName()))) {
+            dynamo.updateTable(request -> request.tableName(TABLE)
+                    .attributeDefinitions(a -> a.attributeName(PENDING_BUCKET).attributeType("S"),
+                            a -> a.attributeName(SORT).attributeType("S"))
+                    .globalSecondaryIndexUpdates(update -> update.create(index -> index.indexName(PENDING_INDEX)
+                            .keySchema(k -> k.attributeName(PENDING_BUCKET).keyType(KeyType.HASH),
+                                    k -> k.attributeName(SORT).keyType(KeyType.RANGE))
+                            .projection(p -> p.projectionType(ProjectionType.INCLUDE)
+                                    .nonKeyAttributes(CUSTOMER, "status", "createdAt", "totalCents")))));
+        }
+        if (keyExists(PENDING_BACKFILL)) {
+            return;
+        }
+
+        // Upgrade existing local data. The guard makes the backfill safe to resume.
+        var pages = dynamo.scanPaginator(request -> request.tableName(TABLE).consistentRead(true)
+                .filterExpression("#status = :pending AND attribute_not_exists(pendingBucket)")
+                .projectionExpression("#id")
+                .expressionAttributeNames(Map.of("#id", ID, "#status", "status"))
+                .expressionAttributeValues(Map.of(":pending", str(PENDING))));
+        for (var item : pages.items()) {
+            var id = item.get(ID);
+            try {
+                dynamo.updateItem(request -> request.tableName(TABLE).key(Map.of(ID, id))
+                        .conditionExpression("#status = :pending AND attribute_not_exists(pendingBucket)")
+                        .updateExpression("SET pendingBucket = :pending")
+                        .expressionAttributeNames(Map.of("#status", "status"))
+                        .expressionAttributeValues(Map.of(":pending", str(PENDING))));
+            } catch (ConditionalCheckFailedException alreadyHandled) {
+                // Another write won after the scan read this item.
+            }
+        }
+        seedIfAbsent(key(PENDING_BACKFILL));
     }
 
     private boolean keyExists(String id) {
@@ -184,6 +250,9 @@ public class DynamoOrderRepository implements OrderStore {
                 "items", AttributeValue.fromL(items)));
         if (order.confirmedAt() != null) {
             record.put("confirmedAt", num(order.confirmedAt().toEpochMilli()));
+        }
+        if (PENDING.equals(order.status())) {
+            record.put(PENDING_BUCKET, str(PENDING));
         }
         return record;
     }

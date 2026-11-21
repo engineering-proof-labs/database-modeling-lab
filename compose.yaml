@@ -1,3 +1,6 @@
+x-api-clock: &api-clock
+  LAB_CLOCK_INSTANT: "${LAB_CLOCK_INSTANT:-}"
+
 x-api-common: &api-common
   build: .
   ports:
@@ -25,6 +28,7 @@ services:
     <<: *api-common
     profiles: ["postgres"]
     environment:
+      <<: *api-clock
       SPRING_PROFILES_ACTIVE: postgres
       DB_URL: jdbc:postgresql://postgres:5432/orders
       DB_USERNAME: orders_app
@@ -54,6 +58,7 @@ services:
     <<: *api-common
     profiles: ["mongodb"]
     environment:
+      <<: *api-clock
       SPRING_PROFILES_ACTIVE: mongodb
       MONGODB_URI: mongodb://mongodb:27017
       MONGODB_DATABASE: orders
@@ -91,6 +96,7 @@ services:
     <<: *api-common
     profiles: ["dynamodb"]
     environment:
+      <<: *api-clock
       SPRING_PROFILES_ACTIVE: dynamodb
       DYNAMODB_ENDPOINT: http://dynamodb:8000
     depends_on:
@@ -117,6 +123,7 @@ services:
     <<: *api-common
     profiles: ["oracle"]
     environment:
+      <<: *api-clock
       SPRING_PROFILES_ACTIVE: oracle
       DB_URL: jdbc:oracle:thin:@//oracle:1521/FREEPDB1
       DB_USERNAME: orders_app

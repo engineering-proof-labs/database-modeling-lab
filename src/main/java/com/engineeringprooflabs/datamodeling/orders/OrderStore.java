@@ -19,4 +19,6 @@ public interface OrderStore {
     boolean orderExists(String id);
 
     List<OrderSummary> listCustomerOrders(String customerId, CustomerOrderCursor cursor, int fetchLimit);
+
+    List<OrderSummary> listPendingOrders(PendingOrderWindow window, int fetchLimit);
 }

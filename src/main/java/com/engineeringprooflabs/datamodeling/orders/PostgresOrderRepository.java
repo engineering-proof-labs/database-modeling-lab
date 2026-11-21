@@ -150,6 +150,24 @@ public class PostgresOrderRepository implements OrderStore, CreateFailureProbe {
     }
 
     @Override
+    public List<OrderSummary> listPendingOrders(PendingOrderWindow window, int fetchLimit) {
+        var start = OffsetDateTime.ofInstant(window.start(), java.time.ZoneOffset.UTC);
+        var end = OffsetDateTime.ofInstant(window.asOf(), java.time.ZoneOffset.UTC);
+        String query = """
+                SELECT id, customer_id, status, total_cents, created_at
+                FROM orders
+                WHERE status = 'PENDING' AND created_at >= ? AND created_at < ?
+                """;
+        String orderAndLimit = " ORDER BY created_at DESC, id DESC LIMIT ?";
+        if (window.after() == null) {
+            return jdbc.query(query + orderAndLimit, ORDER_SUMMARY_MAPPER, start, end, fetchLimit);
+        }
+        var afterTime = OffsetDateTime.ofInstant(window.after().createdAt(), java.time.ZoneOffset.UTC);
+        return jdbc.query(query + " AND (created_at, id) < (?, ?)" + orderAndLimit,
+                ORDER_SUMMARY_MAPPER, start, end, afterTime, window.after().id(), fetchLimit);
+    }
+
+    @Override
     public Optional<OrderView> findById(String id) {
         UUID orderId = parseOrderId(id);
         if (orderId == null) {
