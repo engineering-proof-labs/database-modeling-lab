@@ -1,6 +1,6 @@
 # One Orders API, Four Databases
 
-This lab runs one small orders API against PostgreSQL, MongoDB, DynamoDB Local, and Oracle. Each implementation keeps its database operations visible so the same contract can be compared across relational, document, and key-value models.
+This lab compares the same orders API on PostgreSQL, MongoDB, and DynamoDB Local. Oracle is the next database in the comparison. Each adapter exposes its database operations directly in the code.
 
 The PostgreSQL slice uses PostgreSQL 17.12, Java 21, Spring Boot 4.2.0, Flyway 11.20.0, and the PostgreSQL JDBC driver 42.7.8. The MongoDB slice uses MongoDB 8.0.38 and the synchronous Java driver 5.15.0. Docker Compose profiles start only the selected database and API. Database and Java images use fixed version tags.
 
@@ -101,7 +101,7 @@ Get-Content -Raw .\scripts\explain-customer-orders.sql | docker compose --profil
 Stop the current profile before switching databases so both APIs do not compete for port 18081:
 
 ```sh
-docker compose --profile postgres --profile mongodb down --remove-orphans
+docker compose --profile "*" down --remove-orphans
 docker compose --profile mongodb up --build -d
 docker compose --profile mongodb ps
 ```
@@ -132,18 +132,54 @@ MongoDB stores the order and its bounded, immutable item list together because c
 
 The PostgreSQL-only failure hook is disabled for MongoDB. A single document insert is the atomicity demonstration here; the PostgreSQL hook instead demonstrates rollback across separate order and item rows.
 
+## Run the DynamoDB Local slice
+
+```sh
+docker compose --profile "*" down --remove-orphans
+docker compose --profile dynamodb up --build -d
+docker compose --profile dynamodb logs -f api-dynamodb
+```
+
+The profile starts DynamoDB Local 3.3.2 and the API with AWS SDK for Java 2.55.15. A setup container makes the database volume writable by the image's service account. The SDK targets the Compose service with static local credentials and region `us-east-1`. On startup, the adapter creates the table and inserts missing fixtures without replacing existing orders. Wait for the API's startup line, then run the shared PowerShell checks.
+
+```powershell
+.\scripts\verify-pagination.ps1
+.\scripts\verify-concurrency.ps1 -Iterations 10
+```
+
+| Operation | Access | Result |
+| --- | --- | --- |
+| Create | Conditional `PutItem` by order UUID | One item containing the order and its line items |
+| Get | Strong `GetItem` by order UUID | Full order |
+| Confirm | `UpdateItem` conditioned on `PENDING` | One state transition, followed by a strong read |
+| List by customer | Descending `Query` on the `customer-created` global secondary index | Order summaries, eventually consistent |
+
+The index partitions by `customerId` and orders by `createdOrder`, a fixed-width timestamp followed by the UUID. The HTTP cursor identifies the last summary delivered. The adapter reconstructs `ExclusiveStartKey` from it, so the extra record used to detect another page is available on the next request.
+
+Inspect the table and index through the local DynamoDB API:
+
+```sh
+docker compose --profile dynamodb exec -T dynamodb curl -fsS \
+  --aws-sigv4 aws:amz:us-east-1:dynamodb --user local:local \
+  -H 'Content-Type: application/x-amz-json-1.0' \
+  -H 'X-Amz-Target: DynamoDB_20120810.DescribeTable' \
+  -d '{"TableName":"orders-lab"}' http://localhost:8000/
+```
+
+The local run demonstrates key selection, pagination, and conditional writes. Managed DynamoDB throughput, physical distribution, propagation delay, and latency require separate measurements. [DynamoDB Local usage notes](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.UsageNotes.html)
+
 ## Stop and reset
 
 Stop the services and keep database data:
 
 ```sh
-docker compose --profile postgres --profile mongodb down --remove-orphans
+docker compose --profile "*" down --remove-orphans
 ```
 
 Remove the local database volume and all lab data:
 
 ```sh
-docker compose --profile postgres --profile mongodb down --volumes --remove-orphans
+docker compose --profile "*" down --volumes --remove-orphans
 ```
 
 The Compose credentials and exposed ports are for local learning only.
@@ -154,6 +190,7 @@ The Compose credentials and exposed ports are for local learning only.
 - Implemented: `GET /orders/{id}` with order and item data; missing IDs return 404.
 - Implemented: conditional confirmation with `200`, `409`, and `404` outcomes, plus customer-order keyset pagination with a customer-scoped opaque cursor.
 - Implemented: MongoDB document storage with embedded items, conditional confirmation, and customer-order keyset pagination.
-- Not implemented yet: pending-order pagination and the DynamoDB and Oracle adapters.
+- Implemented: DynamoDB Local item storage, conditional confirmation, and pagination on a customer index.
+- Pending: Oracle and the cross-customer list of recent pending orders.
 
 Money is stored as integer cents, timestamps are stored as UTC instants, and item rows are immutable after creation. The common limit is 20 items, 999 units per item, 120 characters per product name, and at most 100,000,000 cents per unit. These bounds keep the same order representable in the later database models.

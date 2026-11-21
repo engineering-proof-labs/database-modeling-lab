@@ -62,6 +62,42 @@ services:
       mongodb:
         condition: service_healthy
 
+  dynamodb-volume:
+    profiles: ["dynamodb"]
+    image: amazon/dynamodb-local:3.3.2
+    user: "0:0"
+    entrypoint: ["chown", "1000:1000", "/home/dynamodblocal/data"]
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
+
+  dynamodb:
+    profiles: ["dynamodb"]
+    image: amazon/dynamodb-local:3.3.2
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-disableTelemetry", "-dbPath", "/home/dynamodblocal/data"]
+    ports:
+      - "127.0.0.1:18000:8000"
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
+    depends_on:
+      dynamodb-volume:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--aws-sigv4", "aws:amz:us-east-1:dynamodb", "--user", "local:local", "-H", "Content-Type: application/x-amz-json-1.0", "-H", "X-Amz-Target: DynamoDB_20120810.ListTables", "-d", "{}", "http://localhost:8000/"]
+      interval: 2s
+      timeout: 4s
+      retries: 30
+
+  api-dynamodb:
+    <<: *api-common
+    profiles: ["dynamodb"]
+    environment:
+      SPRING_PROFILES_ACTIVE: dynamodb
+      DYNAMODB_ENDPOINT: http://dynamodb:8000
+    depends_on:
+      dynamodb:
+        condition: service_healthy
+
 volumes:
   postgres-data:
   mongodb-data:
+  dynamodb-data:

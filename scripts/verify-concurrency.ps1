@@ -119,15 +119,15 @@ for ($iteration = 1; $iteration -le $Iterations; $iteration++) {
         throw "The final order state is not confirmed for $($order.id)."
     }
 
-    $firstConfirmedAt = [string]$confirmed.confirmedAt
+    $firstConfirmedAt = [DateTimeOffset]$confirmed.confirmedAt
     $repeat = Invoke-WebRequest -SkipHttpErrorCheck -Uri "$BaseUri/orders/$($order.id)/confirm" -Method Post
     if ($repeat.StatusCode -ne 409) {
         throw "A repeated confirmation must return 409 for $($order.id), got $($repeat.StatusCode)."
     }
     $afterRepeat = Invoke-RestMethod -Uri "$BaseUri/orders/$($order.id)"
-    if ([string]$afterRepeat.confirmedAt -ne $firstConfirmedAt) {
+    if ([DateTimeOffset]$afterRepeat.confirmedAt -ne $firstConfirmedAt) {
         throw "A repeated confirmation changed confirmedAt for $($order.id)."
     }
 
-    "iteration=$iteration orderId=$($order.id) race=$($statuses -join ',') final=$($confirmed.status) repeat=$($repeat.StatusCode) confirmedAt=$firstConfirmedAt"
+    "iteration=$iteration orderId=$($order.id) race=$($statuses -join ',') final=$($confirmed.status) repeat=$($repeat.StatusCode) confirmedAt=$($firstConfirmedAt.ToString('o'))"
 }
