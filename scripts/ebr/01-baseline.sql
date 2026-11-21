@@ -1,0 +1,23 @@
+WHENEVER OSERROR EXIT FAILURE
+WHENEVER SQLERROR EXIT SQL.SQLCODE ROLLBACK
+ALTER SESSION SET CONTAINER = FREEPDB1;
+
+CREATE USER orders_ebr IDENTIFIED BY OrdersEbrLocal42
+    DEFAULT TABLESPACE orders_data QUOTA 16M ON orders_data;
+GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW, CREATE TRIGGER TO orders_ebr;
+ALTER USER orders_ebr ENABLE EDITIONS;
+
+CONNECT orders_ebr/OrdersEbrLocal42@//localhost:1521/FREEPDB1
+ALTER SESSION SET EDITION = ORA$BASE;
+
+CREATE TABLE purchase_orders (
+    id NUMBER(12,0) PRIMARY KEY,
+    total_cents NUMBER(10,0) NOT NULL CHECK (total_cents >= 0)
+);
+
+CREATE EDITIONING VIEW purchase_order_api AS
+    SELECT id, total_cents AS total_value FROM purchase_orders;
+
+INSERT INTO purchase_order_api (id, total_value) VALUES (1, 1299);
+COMMIT;
+EXIT SUCCESS

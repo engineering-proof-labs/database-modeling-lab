@@ -144,7 +144,7 @@ services:
         condition: service_healthy
 
   oracle:
-    profiles: ["oracle"]
+    profiles: ["oracle", "ebr"]
     image: container-registry.oracle.com/database/free:23.26.4.0-lite
     stop_grace_period: 90s
     environment:
@@ -169,6 +169,32 @@ services:
       DB_USERNAME: orders_app
       DB_PASSWORD: OrdersLocal42
       LAB_FAILURE_INJECTION_ENABLED: "true"
+    depends_on:
+      oracle:
+        condition: service_healthy
+
+  api-ebr-v1:
+    profiles: ["ebr"]
+    build: .
+    ports:
+      - "127.0.0.1:18083:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: oracle-ebr
+      LAB_EBR_VERSION: V1
+      JAVA_TOOL_OPTIONS: "-Doracle.jdbc.editionName=ORA$$BASE"
+    depends_on:
+      oracle:
+        condition: service_healthy
+
+  api-ebr-v2:
+    profiles: ["ebr"]
+    build: .
+    ports:
+      - "127.0.0.1:18084:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: oracle-ebr
+      LAB_EBR_VERSION: V2
+      JAVA_TOOL_OPTIONS: "-Doracle.jdbc.editionName=ORDERS_V2"
     depends_on:
       oracle:
         condition: service_healthy

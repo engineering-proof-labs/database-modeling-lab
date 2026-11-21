@@ -322,6 +322,49 @@ $orderId = '<order-id>'
 docker compose --profile replicas exec -T postgres psql -v ON_ERROR_STOP=1 -U orders_app -d orders -c "SELECT id, status, confirmed_at FROM orders WHERE id = '$orderId'::uuid;"
 ```
 
+## Oracle editioning experiment
+
+The optional `ebr` profile uses the same Oracle Free image and a dedicated `ORDERS_EBR` schema. An administrator creates the user and child edition in `FREEPDB1`. The application account has session, table, view and trigger privileges, a 16 MB quota and permission to use `ORDERS_V2`. The main Oracle adapter continues to use `ORDERS_APP`.
+
+```mermaid
+flowchart LR
+    V1["V1 / totalCents"] --> EV1["ORA$BASE view"]
+    V2["V2 / totalAmount"] --> EV2["ORDERS_V2 view"]
+    EV1 --> C["total_cents"]
+    EV2 --> A["total_amount"]
+    C -- "forward trigger: divide by 100" --> A
+    A -- "reverse trigger: multiply by 100" --> C
+```
+
+Both versions use the same view name. The JDBC driver selects the edition when each connection opens. The view then maps `total_value` to either integer cents or a two-decimal amount. These representations map exactly within the lab's range. [Oracle EBR guide](https://docs.oracle.com/en/database/oracle/oracle-database/26/adfns/editions.html)
+
+Run the following stages in order on a local Oracle volume where the EBR schema and child edition have not been created. Run the Oracle database before starting either API so the scripts can configure each edition. Use PowerShell 7 from the repository root:
+
+```powershell
+docker compose --profile ebr up -d --wait oracle
+Get-Content -Raw scripts/ebr/01-baseline.sql | docker compose --profile ebr exec -T oracle sqlplus -L -s / as sysdba
+docker compose --profile ebr up -d --build api-ebr-v1
+pwsh -NoProfile -File scripts/verify-ebr.ps1 -Phase baseline
+
+Get-Content -Raw scripts/ebr/02-compatibility.sql | docker compose --profile ebr exec -T oracle sqlplus -L -s / as sysdba
+docker compose --profile ebr up -d --build api-ebr-v2
+pwsh -NoProfile -File scripts/verify-ebr.ps1 -Phase compatible
+```
+
+V1 serves `GET` and `PUT /ebr/orders/{id}` on port 18083 with `totalCents`. V2 serves the same paths on port 18084 with `totalAmount`. The forward trigger translates V1 writes after deployment. The reverse trigger keeps V2 writes visible to V1. The migration takes an exclusive table lock for the short fixture backfill. The verifier checks existing orders, inserts and updates in both directions, and a return to V1 while the V2 container is stopped.
+
+The final stage checks that both columns agree, makes the decimal column mandatory and removes the triggers and old column. It acts on the dedicated schema and commits DDL. In this controlled run, leave V1 reachable only to demonstrate the failure after retirement, then stop it:
+
+```powershell
+Get-Content -Raw scripts/ebr/03-retire-cents.sql | docker compose --profile ebr exec -T oracle sqlplus -L -s orders_ebr/OrdersEbrLocal42@//localhost:1521/FREEPDB1
+pwsh -NoProfile -File scripts/verify-ebr.ps1 -Phase retired
+docker compose --profile ebr stop api-ebr-v1
+```
+
+During compatibility, traffic can return to V1 with data created by V2. After retirement, the old view fails and V2 continues to read and write. Reverting the application after that point requires restoring the old representation through a separate database migration. Keep the traffic quiescent during the lab's retirement step. The experiment checks compatibility on Oracle Free and its small locked backfill.
+
+In the local run, V2 wrote `26.07` and V1 read `2607`. With V2 stopped, V1 wrote `3105`. After restarting, V2 read `31.05`. Removing the cents column produced Oracle error `ORA-04063` through the old view and HTTP `500` from V1. V2 read the migrated orders and wrote a new one.
+
 ## Demo walkthrough
 
 1. Show the four storage models, then create the same two-item order in two profiles. Inspect the PostgreSQL rows and the MongoDB document next to their matching HTTP responses.
