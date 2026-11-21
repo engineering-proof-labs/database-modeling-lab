@@ -8,13 +8,16 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
+import org.springframework.context.annotation.Profile;
 import org.springframework.jdbc.core.BatchPreparedStatementSetter;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 @Repository
-public class PostgresOrderRepository {
+@Profile("postgres")
+public class PostgresOrderRepository implements OrderStore, CreateFailureProbe {
 
     private static final RowMapper<OrderHeader> ORDER_HEADER_MAPPER = (rs, rowNum) -> {
         OffsetDateTime confirmedAt = rs.getObject("confirmed_at", OffsetDateTime.class);
@@ -40,13 +43,33 @@ public class PostgresOrderRepository {
         this.jdbc = jdbc;
     }
 
+    @Override
+    public String backend() {
+        return "postgres";
+    }
+
+    @Override
     public boolean customerExists(String customerId) {
         Boolean exists = jdbc.queryForObject(
                 "SELECT EXISTS (SELECT 1 FROM customers WHERE id = ?)", Boolean.class, customerId);
         return Boolean.TRUE.equals(exists);
     }
 
-    public void insertOrder(OrderView order) {
+    @Override
+    @Transactional
+    public void createOrder(OrderView order) {
+        insertOrder(order);
+        insertItems(order);
+    }
+
+    @Override
+    @Transactional
+    public void insertHeaderThenFail(OrderView order) {
+        insertOrder(order);
+        throw new InjectedWriteFailureException();
+    }
+
+    private void insertOrder(OrderView order) {
         jdbc.update("""
                 INSERT INTO orders (id, customer_id, status, total_cents, created_at, confirmed_at)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -55,7 +78,7 @@ public class PostgresOrderRepository {
                 OffsetDateTime.ofInstant(order.createdAt(), java.time.ZoneOffset.UTC), null);
     }
 
-    public void insertItems(OrderView order) {
+    private void insertItems(OrderView order) {
         jdbc.batchUpdate("""
                 INSERT INTO order_items (order_id, item_number, product_name, quantity, unit_price_cents, line_total_cents)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -78,6 +101,7 @@ public class PostgresOrderRepository {
         });
     }
 
+    @Override
     public int confirmPending(String id, Instant confirmedAt) {
         UUID orderId = parseOrderId(id);
         if (orderId == null) {
@@ -91,6 +115,7 @@ public class PostgresOrderRepository {
                 OffsetDateTime.ofInstant(confirmedAt, java.time.ZoneOffset.UTC), orderId);
     }
 
+    @Override
     public boolean orderExists(String id) {
         UUID orderId = parseOrderId(id);
         if (orderId == null) {
@@ -101,6 +126,7 @@ public class PostgresOrderRepository {
         return Boolean.TRUE.equals(exists);
     }
 
+    @Override
     public List<OrderSummary> listCustomerOrders(String customerId, CustomerOrderCursor cursor, int fetchLimit) {
         if (cursor == null) {
             return jdbc.query("""
@@ -123,6 +149,7 @@ public class PostgresOrderRepository {
                 """, ORDER_SUMMARY_MAPPER, customerId, cursorTime, cursor.id(), fetchLimit);
     }
 
+    @Override
     public Optional<OrderView> findById(String id) {
         UUID orderId = parseOrderId(id);
         if (orderId == null) {

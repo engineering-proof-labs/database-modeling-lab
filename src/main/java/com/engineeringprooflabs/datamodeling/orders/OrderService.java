@@ -2,34 +2,40 @@ package com.engineeringprooflabs.datamodeling.orders;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 
 @Service
 public class OrderService {
 
-    private final PostgresOrderRepository repository;
+    private final OrderStore repository;
+    private final ObjectProvider<CreateFailureProbe> failureProbe;
     private final CustomerOrderCursorCodec cursorCodec;
     private final Clock clock;
 
-    public OrderService(PostgresOrderRepository repository, CustomerOrderCursorCodec cursorCodec, Clock clock) {
+    public OrderService(
+            OrderStore repository,
+            ObjectProvider<CreateFailureProbe> failureProbe,
+            CustomerOrderCursorCodec cursorCodec,
+            Clock clock) {
         this.repository = repository;
+        this.failureProbe = failureProbe;
         this.cursorCodec = cursorCodec;
         this.clock = clock;
     }
 
-    @Transactional
     public OrderView create(CreateOrderRequest request, boolean failAfterOrder) {
         if (!repository.customerExists(request.customerId())) {
             throw new CustomerNotFoundException(request.customerId());
         }
 
         String id = UUID.randomUUID().toString();
-        Instant createdAt = clock.instant();
+        Instant createdAt = clock.instant().truncatedTo(ChronoUnit.MILLIS);
         List<OrderItemView> items = new ArrayList<>(request.items().size());
         long totalCents = 0;
         int itemNumber = 1;
@@ -42,13 +48,15 @@ public class OrderService {
 
         OrderView order = new OrderView(id, request.customerId(), "PENDING", totalCents,
                 createdAt, null, List.copyOf(items));
-        repository.insertOrder(order);
-
         if (failAfterOrder) {
-            throw new InjectedWriteFailureException();
+            CreateFailureProbe probe = failureProbe.getIfAvailable();
+            if (probe == null) {
+                throw new FailureInjectionDisabledException();
+            }
+            probe.insertHeaderThenFail(order);
+        } else {
+            repository.createOrder(order);
         }
-
-        repository.insertItems(order);
         return order;
     }
 
@@ -56,9 +64,8 @@ public class OrderService {
         return repository.findById(id).orElseThrow(() -> new OrderNotFoundException(id));
     }
 
-    @Transactional
     public OrderView confirm(String id) {
-        int changedRows = repository.confirmPending(id, clock.instant());
+        int changedRows = repository.confirmPending(id, clock.instant().truncatedTo(ChronoUnit.MILLIS));
         if (changedRows == 1) {
             return findById(id);
         }
@@ -77,7 +84,7 @@ public class OrderService {
         }
 
         CustomerOrderCursor cursor = encodedCursor == null ? null : cursorCodec.decode(encodedCursor);
-        if (cursor != null && (!"postgres".equals(cursor.backend())
+        if (cursor != null && (!repository.backend().equals(cursor.backend())
                 || !customerId.equals(cursor.customerId()) || limit != cursor.limit())) {
             throw new InvalidCursorException();
         }
@@ -86,7 +93,7 @@ public class OrderService {
         boolean hasMore = fetched.size() > limit;
         List<OrderSummary> pageItems = List.copyOf(fetched.subList(0, Math.min(limit, fetched.size())));
         String nextCursor = hasMore
-                ? cursorCodec.encode("postgres", customerId, limit, pageItems.getLast())
+                ? cursorCodec.encode(repository.backend(), customerId, limit, pageItems.getLast())
                 : null;
         return new OrderPage(pageItems, nextCursor);
     }

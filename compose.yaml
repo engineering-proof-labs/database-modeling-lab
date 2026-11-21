@@ -1,5 +1,11 @@
+x-api-common: &api-common
+  build: .
+  ports:
+    - "127.0.0.1:18081:8080"
+
 services:
   postgres:
+    profiles: ["postgres"]
     image: postgres:17.12-bookworm
     environment:
       POSTGRES_DB: orders
@@ -15,18 +21,47 @@ services:
       timeout: 3s
       retries: 30
 
-  api:
-    build: .
+  api-postgres:
+    <<: *api-common
+    profiles: ["postgres"]
     environment:
+      SPRING_PROFILES_ACTIVE: postgres
       DB_URL: jdbc:postgresql://postgres:5432/orders
       DB_USERNAME: orders_app
       DB_PASSWORD: orders_local
       LAB_FAILURE_INJECTION_ENABLED: "true"
-    ports:
-      - "127.0.0.1:18081:8080"
     depends_on:
       postgres:
         condition: service_healthy
 
+  mongodb:
+    profiles: ["mongodb"]
+    image: mongo:8.0.38-noble
+    environment:
+      MONGO_INITDB_DATABASE: orders
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+      - ./scripts/mongo-init.js:/docker-entrypoint-initdb.d/01-lab-seed.js:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet mongodb://localhost:27017/admin --eval 'db.runCommand({ ping: 1 }).ok' | grep -q 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  api-mongodb:
+    <<: *api-common
+    profiles: ["mongodb"]
+    environment:
+      SPRING_PROFILES_ACTIVE: mongodb
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DATABASE: orders
+      LAB_FAILURE_INJECTION_ENABLED: "false"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
 volumes:
   postgres-data:
+  mongodb-data:
